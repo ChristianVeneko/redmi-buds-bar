@@ -1,48 +1,165 @@
 import BudsProtocol
 import SwiftUI
 
-private struct ContentHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+/// Sections of the connected panel, shown one at a time through the tab bar.
+enum PanelTab: String, CaseIterable {
+    case noise, equalizer, extras, gestures, settings
+
+    var symbol: String {
+        switch self {
+        case .noise: "waveform"
+        case .equalizer: "slider.vertical.3"
+        case .extras: "sparkles"
+        case .gestures: "hand.tap"
+        case .settings: "gearshape"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .noise: tr("Noise control")
+        case .equalizer: tr("Equalizer")
+        case .extras: tr("Extras")
+        case .gestures: tr("Gestures")
+        case .settings: tr("Settings")
+        }
+    }
 }
 
-/// Root of the menu bar window.
+/// Root of the menu bar panel. Its ideal size drives the size of the hosting window.
 struct PanelView: View {
     @Bindable var model: BudsViewModel
-    @State private var contentHeight: CGFloat = 400
+    @AppStorage("selectedPanelTab") private var storedTab = PanelTab.noise.rawValue
     @State private var showSettings = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private let localizer = Localizer.shared
 
+    private var availableTabs: [PanelTab] {
+        let caps = model.budsModel
+        var tabs: [PanelTab] = []
+        if caps.hasNoiseControl { tabs.append(.noise) }
+        if caps.hasEqualizer { tabs.append(.equalizer) }
+        if ExtrasCard.hasContent(model) { tabs.append(.extras) }
+        if caps.hasGestures, !model.state.gestures.isEmpty { tabs.append(.gestures) }
+        tabs.append(.settings)
+        return tabs
+    }
+
+    private var currentTab: PanelTab {
+        let tabs = availableTabs
+        if let stored = PanelTab(rawValue: storedTab), tabs.contains(stored) { return stored }
+        return tabs.first ?? .settings
+    }
+
     var body: some View {
-        ScrollView {
-            VStack(spacing: 10) {
-                HeaderView(model: model)
-                if model.connection == .connected {
-                    let caps = model.budsModel
-                    BatteryCard(battery: model.state.battery, position: model.state.position)
-                    if caps.hasNoiseControl { NoiseCard(model: model) }
-                    if caps.hasEqualizer { EqualizerCard(model: model) }
-                    if ExtrasCard.hasContent(model) { ExtrasCard(model: model) }
-                    if caps.hasGestures, !model.state.gestures.isEmpty { GesturesCard(model: model) }
-                    if !caps.isTestedOnHardware {
-                        Text(tr("Support for this model has not been tested on hardware."))
-                            .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                    }
-                } else {
-                    OfflineCard(model: model)
-                }
-                if showSettings { SettingsCard(model: model) }
-                FooterView(showSettings: $showSettings)
-            }
-            .padding(12)
-            .background(GeometryReader { Color.clear.preference(key: ContentHeightKey.self, value: $0.size.height) })
+        ViewThatFits(in: .vertical) {
+            content
+            ScrollView { content }
+                .scrollIndicators(.hidden)
+                .frame(height: Theme.maxPanelHeight)
         }
-        .scrollIndicators(.hidden)
-        .onPreferenceChange(ContentHeightKey.self) { contentHeight = $0 }
-        .frame(width: Theme.panelWidth, height: min(max(contentHeight, 120), 640))
-        .animation(.smooth(duration: 0.25), value: model.connection)
+        .frame(width: Theme.panelWidth)
+        .animation(reduceMotion ? nil : .smooth(duration: 0.3), value: model.connection)
         .environment(\.locale, localizer.locale)
         .tint(Theme.accent)
+    }
+
+    private var content: some View {
+        VStack(spacing: 12) {
+            HeaderView(model: model)
+            if model.connection == .connected {
+                let caps = model.budsModel
+                BatteryCard(battery: model.state.battery, position: model.state.position)
+                TabBar(tabs: availableTabs, selection: currentTab) { select($0) }
+                tabContent(currentTab)
+                if !caps.isTestedOnHardware {
+                    Text(tr("Support for this model has not been tested on hardware."))
+                        .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                }
+            } else {
+                OfflineCard(model: model)
+                    .transition(.opacity.combined(with: .offset(y: 6)))
+                if showSettings {
+                    SettingsCard(model: model)
+                        .transition(.opacity.combined(with: .offset(y: 6)))
+                }
+            }
+            FooterView(isSettingsActive: model.connection == .connected ? currentTab == .settings : showSettings) {
+                toggleSettings()
+            }
+        }
+        .padding(12)
+    }
+
+    @ViewBuilder private func tabContent(_ tab: PanelTab) -> some View {
+        // A ZStack hosts the transition so the outgoing and incoming sections crossfade in place.
+        ZStack(alignment: .top) {
+            Group {
+                switch tab {
+                case .noise: NoiseCard(model: model)
+                case .equalizer: EqualizerCard(model: model)
+                case .extras: ExtrasCard(model: model)
+                case .gestures: GesturesCard(model: model)
+                case .settings: SettingsCard(model: model)
+                }
+            }
+            .id(tab)
+            .transition(.asymmetric(
+                insertion: .opacity.combined(with: .offset(y: reduceMotion ? 0 : 8)),
+                removal: .opacity))
+        }
+    }
+
+    private func select(_ tab: PanelTab) {
+        withAnimation(Theme.select(reduceMotion)) { storedTab = tab.rawValue }
+    }
+
+    private func toggleSettings() {
+        if model.connection == .connected {
+            if currentTab == .settings {
+                select(availableTabs.first ?? .settings)
+            } else {
+                select(.settings)
+            }
+        } else {
+            withAnimation(reduceMotion ? nil : .smooth(duration: 0.3)) { showSettings.toggle() }
+        }
+    }
+}
+
+/// Icon tab bar with a sliding selection indicator.
+struct TabBar: View {
+    let tabs: [PanelTab]
+    let selection: PanelTab
+    let onSelect: (PanelTab) -> Void
+    @Namespace private var namespace
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(tabs, id: \.self) { tab in
+                let isSelected = tab == selection
+                Button { onSelect(tab) } label: {
+                    Image(systemName: tab.symbol)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(isSelected ? Theme.accent : Color.secondary)
+                        .frame(maxWidth: .infinity, minHeight: 30)
+                        .background {
+                            if isSelected {
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(Theme.selectedFill)
+                                    .matchedGeometryEffect(id: "tabSelection", in: namespace)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(PressScaleStyle(scale: 0.92))
+                .help(tab.title)
+                .accessibilityLabel(tab.title)
+                .accessibilityAddTraits(isSelected ? .isSelected : [])
+            }
+        }
+        .padding(3)
+        .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
     }
 }
 
@@ -69,13 +186,16 @@ struct HeaderView: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: "earbuds")
-                .font(.title2)
-                .foregroundStyle(Theme.accent)
+                .font(.system(size: 17))
+                .foregroundStyle(.primary.opacity(0.8))
+                .frame(width: 36, height: 36)
+                .background(Theme.controlFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             VStack(alignment: .leading, spacing: 2) {
                 Text(verbatim: model.state.name ?? model.deviceName).font(.headline)
                 HStack(spacing: 5) {
-                    Circle().fill(dotColor).frame(width: 7, height: 7)
+                    StatusDot(color: dotColor, pulsing: model.connection == .connecting)
                     Text(statusText).font(.caption).foregroundStyle(.secondary)
+                        .contentTransition(.opacity)
                 }
             }
             Spacer()
@@ -83,14 +203,15 @@ struct HeaderView: View {
                 model.refreshOrReconnect()
             } label: {
                 Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.primary.opacity(0.8))
                     .frame(width: 28, height: 28)
-                    .background(Color.primary.opacity(0.08), in: Circle())
+                    .background(Theme.controlFill, in: Circle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(PressScaleStyle())
             .help(model.connection == .connected ? tr("Refresh") : tr("Reconnect"))
         }
-        .padding(.horizontal, 4)
+        .padding(.horizontal, 2)
     }
 }
 
@@ -110,7 +231,8 @@ struct OfflineCard: View {
                     Text(verbatim: error).font(.caption2).foregroundStyle(.red).multilineTextAlignment(.center)
                 }
                 Button(tr("Reconnect")) { model.reconnect() }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                     .disabled(model.connection == .connecting)
             }
             .frame(maxWidth: .infinity)
@@ -145,6 +267,7 @@ struct BatteryCard: View {
 struct NoiseCard: View {
     let model: BudsViewModel
     @Namespace private var namespace
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         let state = model.state
@@ -153,7 +276,7 @@ struct NoiseCard: View {
             HStack(spacing: 8) {
                 ForEach(model.budsModel.ambientSoundModes, id: \.self) { mode in
                     ModeTile(title: mode.title, symbol: mode.symbol, isSelected: state.noiseMode == mode, namespace: namespace) {
-                        withAnimation(.spring(duration: 0.3)) { model.setNoiseMode(mode) }
+                        withAnimation(Theme.select(reduceMotion)) { model.setNoiseMode(mode) }
                     }
                 }
             }
@@ -181,17 +304,14 @@ struct NoiseCard: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title).font(.caption).foregroundStyle(.secondary)
-            Picker(title, selection: Binding(get: { selection }, set: set)) {
-                ForEach(options, id: \.self) { Text($0[keyPath: label]).tag($0) }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
+            SegmentedControl(options: options, selection: selection, title: { $0[keyPath: label] }, onSelect: set)
         }
     }
 }
 
 struct EqualizerCard: View {
     let model: BudsViewModel
+    @Namespace private var namespace
     private let columns = [GridItem(.adaptive(minimum: 88), spacing: 6)]
 
     var body: some View {
@@ -200,11 +320,15 @@ struct EqualizerCard: View {
         Card(title: tr("Equalizer")) {
             LazyVGrid(columns: columns, spacing: 6) {
                 ForEach(caps.equalizerPresets.filter { $0 != .custom }, id: \.self) { preset in
-                    Chip(title: preset.title, isSelected: state.equalizerPreset == preset) { model.setEqualizerPreset(preset) }
+                    Chip(title: preset.title, isSelected: state.equalizerPreset == preset, namespace: namespace) {
+                        withAnimation(.snappy(duration: 0.25)) { model.setEqualizerPreset(preset) }
+                    }
                 }
                 if caps.supportsCustomEqualizer {
                     ForEach(CustomEqualizerPreset.allCases, id: \.self) { preset in
-                        Chip(title: preset.title, isSelected: model.activeCustomPreset == preset) { model.applyCustomPreset(preset) }
+                        Chip(title: preset.title, isSelected: model.activeCustomPreset == preset, namespace: namespace) {
+                            withAnimation(.snappy(duration: 0.25)) { model.applyCustomPreset(preset) }
+                        }
                     }
                 }
             }
@@ -283,33 +407,25 @@ struct ExtrasCard: View {
                 .font(.caption.weight(.medium))
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 7)
-                .foregroundStyle(active ? Color.white : Color.primary)
-                .background(active ? Color.red : Color.primary.opacity(0.08), in: Capsule())
+                .foregroundStyle(active ? Color.white : Color.primary.opacity(0.85))
+                .background(active ? Color.red.opacity(0.85) : Theme.controlFill, in: Capsule())
                 .contentShape(Capsule())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressScaleStyle())
     }
 }
 
 struct GesturesCard: View {
     let model: BudsViewModel
-    @State private var expanded = false
 
     var body: some View {
-        Card {
-            DisclosureGroup(isExpanded: $expanded) {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(TapType.displayOrder.filter { model.budsModel.supports(tap: $0) }, id: \.self) { tap in
-                        if let assignment = model.state.gestures.first(where: { $0.tap == tap }) {
-                            row(tap: tap, assignment: assignment)
-                        }
-                    }
-                    cycleSection
+        Card(title: tr("Gestures")) {
+            ForEach(TapType.displayOrder.filter { model.budsModel.supports(tap: $0) }, id: \.self) { tap in
+                if let assignment = model.state.gestures.first(where: { $0.tap == tap }) {
+                    row(tap: tap, assignment: assignment)
                 }
-                .padding(.top, 8)
-            } label: {
-                Text(tr("Gestures")).font(.caption.weight(.semibold)).foregroundStyle(.secondary).textCase(.uppercase)
             }
+            cycleSection
         }
     }
 
@@ -394,11 +510,9 @@ struct SettingsCard: View {
             }
             VStack(alignment: .leading, spacing: 4) {
                 Text(tr("Language")).font(.callout)
-                Picker(tr("Language"), selection: $localizer.choice) {
-                    ForEach(Localizer.Choice.allCases, id: \.self) { Text($0.title).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
+                SegmentedControl(
+                    options: Localizer.Choice.allCases, selection: localizer.choice, title: { $0.title },
+                    onSelect: { localizer.choice = $0 })
             }
             SettingToggle(title: tr("Show battery in menu bar"), isOn: showBattery) { showBattery = $0 }
             SettingToggle(title: tr("Low battery notification (below 15%)"), isOn: lowBattery) { lowBattery = $0 }
@@ -411,27 +525,28 @@ struct SettingsCard: View {
 }
 
 struct FooterView: View {
-    @Binding var showSettings: Bool
+    let isSettingsActive: Bool
+    let toggleSettings: () -> Void
 
     var body: some View {
-        HStack {
-            Button {
-                withAnimation(.smooth(duration: 0.25)) { showSettings.toggle() }
-            } label: {
-                Label(tr("Settings"), systemImage: "gearshape")
-            }
-            Spacer()
-            Button {
-                NSApplication.shared.terminate(nil)
-            } label: {
-                Label(tr("Quit"), systemImage: "power")
-            }
-            .keyboardShortcut("q")
+        HStack(spacing: 8) {
+            footerButton(title: tr("Settings"), symbol: "gearshape", isActive: isSettingsActive, action: toggleSettings)
+            footerButton(title: tr("Quit"), symbol: "power", isActive: false) { NSApplication.shared.terminate(nil) }
+                .keyboardShortcut("q")
         }
-        .buttonStyle(.plain)
-        .font(.callout)
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 6)
-        .padding(.top, 2)
+    }
+
+    private func footerButton(title: String, symbol: String, isActive: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: symbol)
+                .font(.callout)
+                .foregroundStyle(isActive ? Theme.accent : Color.primary.opacity(0.8))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(isActive ? Theme.selectedFill : Color.clear, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.hairline, lineWidth: 1))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(PressScaleStyle(scale: 0.97))
     }
 }
